@@ -75,8 +75,6 @@ def test_preprocessor_builds_vocab_and_sequences(example_dataframe):
     preprocessor = SDTMPreprocessor(
         subject_id_col="usubjid",
         sequence_col="exseq",
-        continuous_cols=["exdose", "exstdy"],
-        bin_counts={"exdose": 5, "exstdy": 5},
     )
 
     preprocessor.fit(example_dataframe)
@@ -85,6 +83,8 @@ def test_preprocessor_builds_vocab_and_sequences(example_dataframe):
     assert preprocessor.vocab["[SOS]"] == 1
     assert "arm__A" in preprocessor.vocab
     assert any(key.startswith("exdose__") for key in preprocessor.vocab)
+    assert preprocessor.column_types["exdose"] == "continuous"
+    assert preprocessor.column_types["arm"] == "categorical"
 
     assert len(sequences) == 2
     first_sequence = sequences[0]
