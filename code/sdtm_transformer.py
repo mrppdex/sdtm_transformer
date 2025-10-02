@@ -111,8 +111,10 @@ class SDTMPreprocessor:
             self.bin_edges[col] = bins
             refined_continuous.append(col)
             self.column_types[col] = "continuous"
-            # Ensure nan token exists for continuous columns
-            self._add_to_vocab(f"{col}__nan")
+
+            # Only add a NaN token if the original column actually contains NaNs.
+            if df_processed[col].isna().any():
+                self._add_to_vocab(f"{col}__nan")
 
         self.continuous_cols = refined_continuous
 
@@ -281,6 +283,17 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
     eos_token = preprocessor.vocab['[EOS]']
     
     print(f"\nSynthesizing {num_subjects} subjects with Top-k sampling (k={top_k})...")
+
+    # Pre-compute tokens that should never be sampled as actual values.
+    disallowed_tokens = {
+        preprocessor.vocab.get('[PAD]'),
+        preprocessor.vocab.get('[SOS]'),
+    }
+    disallowed_tokens.update(
+        idx
+        for token, idx in preprocessor.vocab.items()
+        if token.endswith('__nan')
+    )
     with torch.no_grad():
         for i in range(num_subjects):
             subject_seq = [sos_token]
@@ -295,11 +308,7 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
                 # Get the logits for the very last token in the sequence
                 next_token_logits = output[0, -1, :]
 
-                # Prevent sampling of structural tokens that should not appear as values
-                disallowed_tokens = [
-                    preprocessor.vocab.get('[PAD]'),
-                    preprocessor.vocab.get('[SOS]'),
-                ]
+                # Prevent sampling of structural tokens or NaN placeholders
                 for token_id in disallowed_tokens:
                     if token_id is not None:
                         next_token_logits[token_id] = float('-inf')
