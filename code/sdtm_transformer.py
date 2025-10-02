@@ -325,7 +325,7 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
 
     records = []
     expected_cols = preprocessor.columns
-    num_cols = len(expected_cols)
+    expected_cols_set = set(expected_cols)
 
     for i, subject_tokens in enumerate(synthetic_subjects_tokens):
         synth_usubjid = f"SYNTH-{i+1:03d}"
@@ -345,64 +345,65 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
 
         for stream in record_streams:
             # Filter out separator tokens to get only value tokens
-            value_tokens = [t for t in stream if t != preprocessor.vocab['[SEP]']]
+            value_tokens = [
+                t for t in stream if t not in {
+                    preprocessor.vocab['[SEP]'],
+                    preprocessor.vocab['[PAD]']
+                }
+            ]
 
-            # A valid record must have the same number of value tokens as columns
-            if len(value_tokens) == num_cols:
-                record = {}
-                invalid_record = False
+            if not value_tokens:
+                continue
 
-                for col_idx, token_val in enumerate(value_tokens):
-                    col_name = expected_cols[col_idx]
-                    token_str = preprocessor.reverse_vocab.get(token_val)
+            record = {
+                col: np.nan
+                for col in expected_cols
+                if col != preprocessor.subject_id_col
+            }
+            populated = False
 
-                    if token_str is None:
-                        invalid_record = True
-                        break
+            for token_val in value_tokens:
+                token_str = preprocessor.reverse_vocab.get(token_val)
 
-                    if '__' not in token_str:
-                        invalid_record = True
-                        break
+                if token_str is None or '__' not in token_str:
+                    continue
 
-                    token_col, token_value = token_str.split('__', 1)
+                token_col, token_value = token_str.split('__', 1)
 
-                    # Ensure the generated token actually belongs to the column we expect
-                    if token_col != col_name:
-                        invalid_record = True
-                        break
+                # Only keep tokens that map to known columns and skip subject identifier
+                if token_col not in expected_cols_set or token_col == preprocessor.subject_id_col:
+                    continue
 
-                    # Skip copying the subject identifier column since we populate it manually
-                    if col_name == preprocessor.subject_id_col:
-                        continue
-
-                    if preprocessor.column_types.get(col_name) == "continuous":
-                        if token_value == 'nan':
-                            record[col_name] = np.nan
-                        else:
-                            try:
-                                bin_idx = int(token_value)
-                            except ValueError:
-                                record[col_name] = np.nan
-                            else:
-                                edges = preprocessor.bin_edges.get(col_name)
-                                if edges is not None and 0 <= bin_idx < len(edges) - 1:
-                                    lower, upper = edges[bin_idx], edges[bin_idx + 1]
-                                    if np.isfinite(lower) and np.isfinite(upper):
-                                        record[col_name] = np.random.uniform(lower, upper)
-                                    elif np.isfinite(lower):
-                                        record[col_name] = lower
-                                    elif np.isfinite(upper):
-                                        record[col_name] = upper
-                                    else:
-                                        record[col_name] = np.nan
-                                else:
-                                    record[col_name] = np.nan
+                if preprocessor.column_types.get(token_col) == "continuous":
+                    if token_value == 'nan':
+                        record[token_col] = np.nan
                     else:
-                        record[col_name] = token_value if token_value != 'nan' else np.nan
+                        try:
+                            bin_idx = int(token_value)
+                        except ValueError:
+                            record[token_col] = np.nan
+                        else:
+                            edges = preprocessor.bin_edges.get(token_col)
+                            if edges is not None and 0 <= bin_idx < len(edges) - 1:
+                                lower, upper = edges[bin_idx], edges[bin_idx + 1]
+                                if np.isfinite(lower) and np.isfinite(upper):
+                                    record[token_col] = np.random.uniform(lower, upper)
+                                elif np.isfinite(lower):
+                                    record[token_col] = lower
+                                elif np.isfinite(upper):
+                                    record[token_col] = upper
+                                else:
+                                    record[token_col] = np.nan
+                            else:
+                                record[token_col] = np.nan
+                else:
+                    record[token_col] = token_value if token_value != 'nan' else np.nan
 
-                if not invalid_record and record:
-                    record[preprocessor.subject_id_col] = synth_usubjid
-                    records.append(record)
+                populated = True
+
+            if populated:
+                record[preprocessor.subject_id_col] = synth_usubjid
+                records.append(record)
 
     return pd.DataFrame(records)
 
