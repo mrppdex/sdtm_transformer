@@ -279,21 +279,34 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
             # A valid record must have the same number of value tokens as columns
             if len(value_tokens) == num_cols:
                 record = {}
+                invalid_record = False
+
                 for col_idx, token_val in enumerate(value_tokens):
                     col_name = expected_cols[col_idx]
-                    
-                    if col_name == preprocessor.subject_id_col:
-                        continue # Skip populating usubjid from token
-                    
                     token_str = preprocessor.reverse_vocab.get(token_val)
-                    if token_str:
-                        parts = token_str.split('__')
-                        if len(parts) == 2:
-                            _, val = parts
-                            record[col_name] = val
-                
-                # Only add the record if it wasn't empty
-                if record:
+
+                    if token_str is None:
+                        invalid_record = True
+                        break
+
+                    if '__' not in token_str:
+                        invalid_record = True
+                        break
+
+                    token_col, token_value = token_str.split('__', 1)
+
+                    # Ensure the generated token actually belongs to the column we expect
+                    if token_col != col_name:
+                        invalid_record = True
+                        break
+
+                    # Skip copying the subject identifier column since we populate it manually
+                    if col_name == preprocessor.subject_id_col:
+                        continue
+
+                    record[col_name] = token_value if token_value != 'nan' else np.nan
+
+                if not invalid_record and record:
                     record[preprocessor.subject_id_col] = synth_usubjid
                     records.append(record)
 
