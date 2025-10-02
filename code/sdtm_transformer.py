@@ -1,7 +1,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,6 +51,9 @@ class SDTMPreprocessor:
         self.categorical_pad_idx: int = 0
 
         self.continuous_stats: Dict[str, Tuple[float, float]] = {}
+        self.integer_continuous_cols: Set[str] = set()
+
+        self.start_day_col: Optional[str] = None
 
         self.first_row_categorical_dist: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self.first_row_continuous_stats: Dict[str, Tuple[float, float]] = {}
@@ -103,6 +106,12 @@ class SDTMPreprocessor:
                 std = 1.0
             self.continuous_stats[col] = (mean, std)
 
+            non_null = series.dropna()
+            if not non_null.empty:
+                values = non_null.to_numpy()
+                if np.all(np.isclose(values, np.round(values), atol=1e-9)):
+                    self.integer_continuous_cols.add(col)
+
         first_rows = df_processed
         if self.sequence_col and self.sequence_col in df_processed.columns:
             first_rows = df_processed.sort_values(self.sequence_col)
@@ -131,6 +140,25 @@ class SDTMPreprocessor:
             if not np.isfinite(std) or std == 0:
                 std = 1.0
             self.first_row_continuous_stats[col] = (mean, std)
+
+        self.start_day_col = self._detect_start_day_column()
+
+    def _detect_start_day_column(self) -> Optional[str]:
+        priority_columns: List[Tuple[int, str]] = []
+        for col in self.columns:
+            lower = col.lower()
+            if col == self.sequence_col:
+                continue
+            if lower == self.subject_id_col.lower():
+                continue
+            if "stdy" in lower:
+                priority_columns.append((0, col))
+            elif "start" in lower and "day" in lower:
+                priority_columns.append((1, col))
+        if not priority_columns:
+            return None
+        priority_columns.sort()
+        return priority_columns[0][1]
 
     def _encode_categorical_value(self, col: str, value: object) -> int:
         vocab = self.categorical_vocabs[col]
@@ -202,7 +230,14 @@ class SDTMPreprocessor:
         for col in self.continuous_cols:
             mean, std = self.first_row_continuous_stats[col]
             sampled_value = np.random.normal(mean, std)
-            sampled_row[col] = sampled_value
+            if col in self.integer_continuous_cols:
+                sampled_value = float(np.round(sampled_value))
+            row_value = (
+                int(sampled_value)
+                if col in self.integer_continuous_cols and not math.isnan(sampled_value)
+                else sampled_value
+            )
+            sampled_row[col] = row_value
             continuous_values.append(self._encode_continuous_value(col, sampled_value))
 
         return categorical_indices, continuous_values, sampled_row
@@ -215,12 +250,28 @@ class SDTMPreprocessor:
             usubjid = f"SYNTH-{subject_idx:03d}"
             for seq_idx, row in enumerate(subject_rows, start=1):
                 record = {self.subject_id_col: usubjid}
-                if self.sequence_col:
-                    record[self.sequence_col] = seq_idx
                 for col, value in row.items():
                     record[col] = value
                 records.append(record)
-        return pd.DataFrame(records)
+        df = pd.DataFrame(records)
+        if df.empty:
+            return df
+
+        for col in self.integer_continuous_cols:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: int(x) if pd.notna(x) else pd.NA)
+                df[col] = df[col].astype("Int64")
+
+        sort_columns = [self.subject_id_col]
+        if self.start_day_col and self.start_day_col in df.columns:
+            sort_columns.append(self.start_day_col)
+        df = df.sort_values(sort_columns).reset_index(drop=True)
+
+        if self.sequence_col and self.sequence_col in df.columns:
+            df[self.sequence_col] = df.groupby(self.subject_id_col).cumcount() + 1
+            df[self.sequence_col] = df[self.sequence_col].astype("Int64")
+
+        return df
 
 
 class SDTMDataset(Dataset):
@@ -626,9 +677,18 @@ def synthesize_data(
 
                 for idx, preds in enumerate(outputs["continuous_preds"]):
                     predicted_value = preds[0, -1].item()
-                    denorm = preprocessor.denormalize_continuous(preprocessor.continuous_cols[idx], predicted_value)
-                    next_cont_values.append(predicted_value)
-                    next_row[preprocessor.continuous_cols[idx]] = denorm
+                    col_name = preprocessor.continuous_cols[idx]
+                    denorm = preprocessor.denormalize_continuous(col_name, predicted_value)
+                    if col_name in preprocessor.integer_continuous_cols:
+                        denorm = float(np.round(denorm))
+                    stored_value = (
+                        int(denorm)
+                        if col_name in preprocessor.integer_continuous_cols and not math.isnan(denorm)
+                        else denorm
+                    )
+                    next_row[col_name] = stored_value
+                    normalized = preprocessor._encode_continuous_value(col_name, denorm)
+                    next_cont_values.append(normalized)
 
                 subject_rows.append(next_row)
 
