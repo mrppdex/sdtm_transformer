@@ -1,418 +1,649 @@
-import pandas as pd
+
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import math
-import io
+import torch.nn.functional as F
 from pandas.api.types import is_numeric_dtype
+from torch.utils.data import DataLoader, Dataset
 
-# --- 1. Data Preprocessing (Generalized) ---
+
+# --- 1. Data Preprocessing ---
+
+@dataclass
+class SequenceExample:
+    """Container that stores the encoded sequence for one subject."""
+
+    categorical: np.ndarray  # Shape: (seq_len, num_categorical)
+    continuous: np.ndarray  # Shape: (seq_len, num_continuous)
+
 
 class SDTMPreprocessor:
-    """
-    Handles the preprocessing of SDTM data for the transformer model.
-    Converts a DataFrame into tokenized sequences and builds a vocabulary.
-    This class is generalized to handle various SDTM domains.
-    """
+    """Prepares SDTM domain data for the seq2seq transformer."""
+
     def __init__(
         self,
-        subject_id_col,
-        sequence_col,
-        continuous_cols=None,
-        bin_counts=None,
-        auto_detect_continuous=True,
-        min_bins=5,
-        max_bins=50,
-    ):
-        self.vocab = {}
-        self.reverse_vocab = {}
-        self.special_tokens = {
-            "[PAD]": 0,  # Padding
-            "[SOS]": 1,  # Start of Subject Sequence
-            "[EOS]": 2,  # End of Subject Sequence
-            "[SEP]": 3,  # Separator between values in a record
-            "[EOR]": 4,  # End of Record
-        }
-        self.token_counter = len(self.special_tokens)
-
-        # Domain-specific configuration
+        subject_id_col: str,
+        sequence_col: Optional[str],
+        continuous_cols: Optional[List[str]] = None,
+        auto_detect_continuous: bool = True,
+        min_bins: int = 5,
+        max_bins: int = 50,
+    ) -> None:
         self.subject_id_col = subject_id_col
         self.sequence_col = sequence_col
         self.auto_detect_continuous = auto_detect_continuous
         self.user_continuous_cols = set(continuous_cols or [])
-        self.bin_counts = bin_counts.copy() if bin_counts else {}
         self.min_bins = min_bins
         self.max_bins = max_bins
-        self.continuous_cols = []
-        self.column_types = {}
-        self.bin_edges = {}
-        self.columns = []
 
-    def _add_to_vocab(self, item):
-        """Adds a new item to the vocabulary if it's not already present."""
-        if item not in self.vocab:
-            self.vocab[item] = self.token_counter
-            self.reverse_vocab[self.token_counter] = item
-            self.token_counter += 1
+        self.columns: List[str] = []
+        self.column_types: Dict[str, str] = {}
+        self.categorical_cols: List[str] = []
+        self.continuous_cols: List[str] = []
 
-    def fit(self, df):
-        """Fits the preprocessor on the data to build the vocabulary."""
-        self.columns = df.columns.tolist()
+        self.categorical_vocabs: Dict[str, Dict[str, int]] = {}
+        self.categorical_reverse_vocabs: Dict[str, Dict[int, str]] = {}
+        self.categorical_pad_idx: int = 0
+
+        self.continuous_stats: Dict[str, Tuple[float, float]] = {}
+
+        self.first_row_categorical_dist: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self.first_row_continuous_stats: Dict[str, Tuple[float, float]] = {}
+
+    def fit(self, df: pd.DataFrame) -> None:
+        if self.subject_id_col not in df.columns:
+            raise ValueError("subject_id_col not present in dataframe")
+
         df_processed = df.copy()
+        self.columns = [col for col in df_processed.columns if col != self.subject_id_col]
 
         detected_continuous = set()
         if self.auto_detect_continuous:
             for col in self.columns:
-                if col in (self.subject_id_col, self.sequence_col):
-                    continue
-                if is_numeric_dtype(df_processed[col]):
-                    if df_processed[col].nunique(dropna=True) > 1:
-                        detected_continuous.add(col)
+                if is_numeric_dtype(df_processed[col]) and df_processed[col].nunique(dropna=True) > 1:
+                    detected_continuous.add(col)
 
         self.continuous_cols = sorted(
-            (self.user_continuous_cols | detected_continuous)
-            - {self.subject_id_col, self.sequence_col}
+            (self.user_continuous_cols | detected_continuous) - {self.subject_id_col}
         )
+        self.categorical_cols = [
+            col for col in self.columns if col not in self.continuous_cols
+        ]
 
-        # Update column types; default to categorical until confirmed continuous
-        self.column_types = {col: "categorical" for col in self.columns}
+        self.column_types = {
+            col: ("continuous" if col in self.continuous_cols else "categorical")
+            for col in self.columns
+        }
 
-        # Discretize continuous columns
-        refined_continuous = []
+        for col in self.categorical_cols:
+            vocab = {"[PAD]": self.categorical_pad_idx}
+            reverse_vocab = {self.categorical_pad_idx: "[PAD]"}
+            unique_values = (
+                df_processed[col].astype(str).fillna("<NA>").replace("nan", "<NA>")
+            ).unique()
+            next_index = 1
+            for val in unique_values:
+                if val not in vocab:
+                    vocab[val] = next_index
+                    reverse_vocab[next_index] = val
+                    next_index += 1
+            self.categorical_vocabs[col] = vocab
+            self.categorical_reverse_vocabs[col] = reverse_vocab
+
         for col in self.continuous_cols:
-            if col not in df_processed.columns:
-                continue
+            series = df_processed[col].astype(float)
+            mean = float(series.mean()) if not series.dropna().empty else 0.0
+            std = float(series.std()) if series.std() not in (0, np.nan) else 1.0
+            if not np.isfinite(std) or std == 0:
+                std = 1.0
+            self.continuous_stats[col] = (mean, std)
 
-            unique_values = df_processed[col].nunique(dropna=True)
-            if unique_values <= 1:
-                continue
+        first_rows = df_processed
+        if self.sequence_col and self.sequence_col in df_processed.columns:
+            first_rows = df_processed.sort_values(self.sequence_col)
+        first_rows = first_rows.groupby(self.subject_id_col).head(1)
 
-            num_bins = self.bin_counts.get(col)
-            if num_bins is None:
-                num_bins = int(math.sqrt(unique_values)) if unique_values > 0 else self.min_bins
-                num_bins = max(self.min_bins, min(self.max_bins, num_bins))
-            else:
-                num_bins = max(2, num_bins)
-
-            binned, bins = pd.cut(
-                df_processed[col],
-                bins=num_bins,
-                labels=False,
-                include_lowest=True,
-                retbins=True,
-                duplicates="drop",
+        for col in self.categorical_cols:
+            counts = (
+                first_rows[col]
+                .astype(str)
+                .fillna("<NA>")
+                .replace("nan", "<NA>")
+                .value_counts()
             )
-
-            if bins is None or len(bins) <= 1:
-                continue
-
-            df_processed[f"{col}_binned"] = binned
-            self.bin_edges[col] = bins
-            refined_continuous.append(col)
-            self.column_types[col] = "continuous"
-            # Ensure nan token exists for continuous columns
-            self._add_to_vocab(f"{col}__nan")
-
-        self.continuous_cols = refined_continuous
-
-        # Build vocabulary from all columns
-        for col in self.columns:
-            if col in self.continuous_cols:
-                binned_col_name = f"{col}_binned"
-                if binned_col_name not in df_processed:
-                    continue
-                unique_values = df_processed[binned_col_name].dropna().unique()
-                for val in unique_values:
-                    self._add_to_vocab(f"{col}__{int(val)}")  # Ensure value is int for consistency
+            if counts.empty:
+                values = np.array(["<NA>"])
+                probs = np.array([1.0])
             else:
-                unique_values = df_processed[col].astype(str).unique()
-                for val in unique_values:
-                    self._add_to_vocab(f"{col}__{val}")
-        
-        for token, index in self.special_tokens.items():
-            self.vocab[token] = index
-            self.reverse_vocab[index] = token
+                values = counts.index.to_numpy()
+                probs = (counts / counts.sum()).to_numpy()
+            self.first_row_categorical_dist[col] = (values, probs)
 
-    def transform(self, df):
-        """Transforms the DataFrame into a list of tokenized sequences, one per subject."""
-        if not self.vocab:
-            raise RuntimeError("Preprocessor must be fitted before transforming data.")
-        
-        df_processed = df.copy()
-        
-        # Apply the same binning
         for col in self.continuous_cols:
-            if col in df_processed.columns and col in self.bin_edges:
-                df_processed[f"{col}_binned"] = pd.cut(
-                    df_processed[col],
-                    bins=self.bin_edges[col],
-                    labels=False,
-                    include_lowest=True,
-                )
+            series = first_rows[col].astype(float)
+            mean = float(series.mean()) if not series.dropna().empty else 0.0
+            std = float(series.std()) if series.std() not in (0, np.nan) else 1.0
+            if not np.isfinite(std) or std == 0:
+                std = 1.0
+            self.first_row_continuous_stats[col] = (mean, std)
 
-        tokenized_subjects = []
+    def _encode_categorical_value(self, col: str, value: object) -> int:
+        vocab = self.categorical_vocabs[col]
+        key = str(value) if pd.notna(value) else "<NA>"
+        if key == "nan":
+            key = "<NA>"
+        return vocab.get(key, self.categorical_pad_idx)
+
+    def _encode_continuous_value(self, col: str, value: object) -> float:
+        mean, std = self.continuous_stats[col]
+        if pd.isna(value):
+            return 0.0
+        return float((float(value) - mean) / std)
+
+    def encode_row(self, row: pd.Series) -> Tuple[List[int], List[float]]:
+        cat_values = [self._encode_categorical_value(col, row.get(col)) for col in self.categorical_cols]
+        cont_values = [self._encode_continuous_value(col, row.get(col)) for col in self.continuous_cols]
+        return cat_values, cont_values
+
+    def transform(self, df: pd.DataFrame) -> List[SequenceExample]:
+        if not self.columns:
+            raise RuntimeError("Preprocessor must be fitted before transforming data.")
+
+        df_processed = df.copy()
+        if self.sequence_col and self.sequence_col in df_processed.columns:
+            df_processed = df_processed.sort_values([self.subject_id_col, self.sequence_col])
+
+        sequences: List[SequenceExample] = []
         for _, group in df_processed.groupby(self.subject_id_col):
-            subject_sequence = [self.vocab['[SOS]']]
-            
-            group_to_process = group
-            if self.sequence_col and self.sequence_col in group.columns:
-                group_to_process = group.sort_values(self.sequence_col)
-                
-            for _, row in group_to_process.iterrows():
-                record_tokens = []
-                for col in self.columns:
-                    if col in self.continuous_cols:
-                        binned_col_name = f"{col}_binned"
-                        value = row[binned_col_name]
-                        # Handle potential NaNs from binning
-                        token_str = f"{col}__{int(value)}" if pd.notna(value) else f"{col}__nan"
-                    else:
-                        value = str(row[col])
-                        token_str = f"{col}__{value}"
-                    record_tokens.append(self.vocab.get(token_str, self.vocab['[PAD]']))
+            cat_rows: List[List[int]] = []
+            cont_rows: List[List[float]] = []
+            for _, row in group.iterrows():
+                cat_values, cont_values = self.encode_row(row)
+                cat_rows.append(cat_values)
+                cont_rows.append(cont_values)
 
-                # Join the tokens for one record with [SEP]
-                for i, token in enumerate(record_tokens):
-                    subject_sequence.append(token)
-                    if i < len(record_tokens) - 1:
-                        subject_sequence.append(self.vocab['[SEP]'])
+            cat_array = (
+                np.array(cat_rows, dtype=np.int64)
+                if self.categorical_cols
+                else np.zeros((len(cont_rows), 0), dtype=np.int64)
+            )
+            cont_array = (
+                np.array(cont_rows, dtype=np.float32)
+                if self.continuous_cols
+                else np.zeros((len(cat_rows), 0), dtype=np.float32)
+            )
+            sequences.append(SequenceExample(categorical=cat_array, continuous=cont_array))
 
-                # Add End of Record token after each full record
-                subject_sequence.append(self.vocab['[EOR]'])
-            
-            subject_sequence.append(self.vocab['[EOS]'])
-            tokenized_subjects.append(subject_sequence)
-            
-        return tokenized_subjects
+        return sequences
 
-    def get_vocab_size(self):
-        return len(self.vocab)
+    def denormalize_continuous(self, col: str, value: float) -> float:
+        mean, std = self.continuous_stats[col]
+        return value * std + mean
 
-# --- 2. PyTorch Dataset and Dataloader (Unchanged) ---
+    def decode_categorical(self, col: str, index: int) -> str:
+        return self.categorical_reverse_vocabs[col].get(index, "<UNK>")
+
+    def sample_first_row(self) -> Tuple[List[int], List[float], Dict[str, object]]:
+        sampled_row: Dict[str, object] = {}
+        categorical_indices: List[int] = []
+        continuous_values: List[float] = []
+
+        for col in self.categorical_cols:
+            values, probs = self.first_row_categorical_dist[col]
+            sampled_value = np.random.choice(values, p=probs)
+            sampled_row[col] = sampled_value if sampled_value != "<NA>" else np.nan
+            categorical_indices.append(self._encode_categorical_value(col, sampled_value))
+
+        for col in self.continuous_cols:
+            mean, std = self.first_row_continuous_stats[col]
+            sampled_value = np.random.normal(mean, std)
+            sampled_row[col] = sampled_value
+            continuous_values.append(self._encode_continuous_value(col, sampled_value))
+
+        return categorical_indices, continuous_values, sampled_row
+
+    def build_dataframe_from_sequences(
+        self, sequences: List[List[Dict[str, object]]]
+    ) -> pd.DataFrame:
+        records: List[Dict[str, object]] = []
+        for subject_idx, subject_rows in enumerate(sequences, start=1):
+            usubjid = f"SYNTH-{subject_idx:03d}"
+            for seq_idx, row in enumerate(subject_rows, start=1):
+                record = {self.subject_id_col: usubjid}
+                if self.sequence_col:
+                    record[self.sequence_col] = seq_idx
+                for col, value in row.items():
+                    record[col] = value
+                records.append(record)
+        return pd.DataFrame(records)
+
 
 class SDTMDataset(Dataset):
-    """Custom PyTorch Dataset for SDTM sequences."""
-    def __init__(self, sequences, max_seq_len):
-        self.sequences = sequences
-        self.max_seq_len = max_seq_len
+    """PyTorch dataset that serves encoder/decoder examples for each subject."""
 
-    def __len__(self):
+    def __init__(self, sequences: List[SequenceExample]):
+        self.sequences = sequences
+        if sequences:
+            self.num_categorical = sequences[0].categorical.shape[1]
+            self.num_continuous = sequences[0].continuous.shape[1]
+        else:
+            self.num_categorical = 0
+            self.num_continuous = 0
+
+    def __len__(self) -> int:
         return len(self.sequences)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         seq = self.sequences[idx]
-        if len(seq) > self.max_seq_len:
-            seq = seq[:self.max_seq_len]
-        else:
-            seq = seq + [0] * (self.max_seq_len - len(seq))
-        input_seq = torch.tensor(seq[:-1], dtype=torch.long)
-        target_seq = torch.tensor(seq[1:], dtype=torch.long)
-        return input_seq, target_seq
+        cat = torch.from_numpy(seq.categorical) if self.num_categorical > 0 else torch.empty((seq.continuous.shape[0], 0), dtype=torch.long)
+        cont = torch.from_numpy(seq.continuous) if self.num_continuous > 0 else torch.empty((seq.categorical.shape[0], 0), dtype=torch.float32)
 
-# --- 3. Transformer Model Architecture (Unchanged) ---
+        seq_len = cat.shape[0] if self.num_categorical > 0 else cont.shape[0]
+        if seq_len == 0:
+            raise ValueError("Encountered an empty sequence during dataset construction.")
+
+        encoder_cat = cat[:1].clone()
+        encoder_cont = cont[:1].clone()
+        decoder_cat = cat.clone()
+        decoder_cont = cont.clone()
+
+        target_cat = torch.zeros_like(decoder_cat)
+        target_cont = torch.zeros_like(decoder_cont)
+        target_cat_mask = torch.zeros_like(decoder_cat, dtype=torch.bool)
+        target_cont_mask = torch.zeros_like(decoder_cont, dtype=torch.bool)
+        stop_targets = torch.zeros(decoder_cat.shape[0], dtype=torch.float32)
+
+        for t in range(seq_len):
+            if t + 1 < seq_len:
+                if self.num_categorical > 0:
+                    target_cat[t] = decoder_cat[t + 1]
+                    target_cat_mask[t] = True
+                if self.num_continuous > 0:
+                    target_cont[t] = decoder_cont[t + 1]
+                    target_cont_mask[t] = True
+            else:
+                stop_targets[t] = 1.0
+
+        return {
+            "encoder_categorical": encoder_cat,
+            "encoder_continuous": encoder_cont,
+            "decoder_categorical": decoder_cat,
+            "decoder_continuous": decoder_cont,
+            "target_categorical": target_cat,
+            "target_continuous": target_cont,
+            "target_categorical_mask": target_cat_mask,
+            "target_continuous_mask": target_cont_mask,
+            "stop_targets": stop_targets,
+        }
+
+    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]):
+        batch_size = len(batch)
+        num_categorical = self.num_categorical
+        num_continuous = self.num_continuous
+
+        max_enc_len = max(
+            (item["encoder_categorical"].shape[0] if num_categorical > 0 else item["encoder_continuous"].shape[0])
+            for item in batch
+        )
+        max_dec_len = max(
+            (item["decoder_categorical"].shape[0] if num_categorical > 0 else item["decoder_continuous"].shape[0])
+            for item in batch
+        )
+
+        if num_categorical > 0:
+            encoder_cat = torch.zeros((batch_size, max_enc_len, num_categorical), dtype=torch.long)
+            decoder_cat = torch.zeros((batch_size, max_dec_len, num_categorical), dtype=torch.long)
+            target_cat = torch.zeros((batch_size, max_dec_len, num_categorical), dtype=torch.long)
+            target_cat_mask = torch.zeros((batch_size, max_dec_len, num_categorical), dtype=torch.bool)
+        else:
+            encoder_cat = torch.empty((batch_size, max_enc_len, 0), dtype=torch.long)
+            decoder_cat = torch.empty((batch_size, max_dec_len, 0), dtype=torch.long)
+            target_cat = torch.empty((batch_size, max_dec_len, 0), dtype=torch.long)
+            target_cat_mask = torch.empty((batch_size, max_dec_len, 0), dtype=torch.bool)
+
+        if num_continuous > 0:
+            encoder_cont = torch.zeros((batch_size, max_enc_len, num_continuous), dtype=torch.float32)
+            decoder_cont = torch.zeros((batch_size, max_dec_len, num_continuous), dtype=torch.float32)
+            target_cont = torch.zeros((batch_size, max_dec_len, num_continuous), dtype=torch.float32)
+            target_cont_mask = torch.zeros((batch_size, max_dec_len, num_continuous), dtype=torch.bool)
+        else:
+            encoder_cont = torch.empty((batch_size, max_enc_len, 0), dtype=torch.float32)
+            decoder_cont = torch.empty((batch_size, max_dec_len, 0), dtype=torch.float32)
+            target_cont = torch.empty((batch_size, max_dec_len, 0), dtype=torch.float32)
+            target_cont_mask = torch.empty((batch_size, max_dec_len, 0), dtype=torch.bool)
+
+        stop_targets = torch.zeros((batch_size, max_dec_len), dtype=torch.float32)
+        stop_mask = torch.zeros((batch_size, max_dec_len), dtype=torch.bool)
+
+        for i, item in enumerate(batch):
+            enc_len = item["encoder_categorical"].shape[0] if num_categorical > 0 else item["encoder_continuous"].shape[0]
+            dec_len = item["decoder_categorical"].shape[0] if num_categorical > 0 else item["decoder_continuous"].shape[0]
+
+            if num_categorical > 0:
+                encoder_cat[i, :enc_len] = item["encoder_categorical"]
+                decoder_cat[i, :dec_len] = item["decoder_categorical"]
+                target_cat[i, :dec_len] = item["target_categorical"]
+                target_cat_mask[i, :dec_len] = item["target_categorical_mask"]
+            if num_continuous > 0:
+                encoder_cont[i, :enc_len] = item["encoder_continuous"]
+                decoder_cont[i, :dec_len] = item["decoder_continuous"]
+                target_cont[i, :dec_len] = item["target_continuous"]
+                target_cont_mask[i, :dec_len] = item["target_continuous_mask"]
+
+            stop_targets[i, :dec_len] = item["stop_targets"]
+            stop_mask[i, :dec_len] = True
+
+        encoder_padding_mask = torch.zeros((batch_size, max_enc_len), dtype=torch.bool)
+        decoder_padding_mask = ~stop_mask
+
+        return {
+            "encoder_categorical": encoder_cat,
+            "encoder_continuous": encoder_cont,
+            "decoder_categorical": decoder_cat,
+            "decoder_continuous": decoder_cont,
+            "target_categorical": target_cat,
+            "target_continuous": target_cont,
+            "target_categorical_mask": target_cat_mask,
+            "target_continuous_mask": target_cont_mask,
+            "stop_targets": stop_targets,
+            "stop_mask": stop_mask,
+            "encoder_padding_mask": encoder_padding_mask,
+            "decoder_padding_mask": decoder_padding_mask,
+        }
+
+
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
+
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
 
-    def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
 
-class TabularTransformer(nn.Module):
-    """A GPT-style decoder-only transformer for tabular data generation."""
-    def __init__(self, vocab_size, d_model, nhead, num_layers, dim_feedforward, dropout=0.1):
-        super(TabularTransformer, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout)
-        decoder_layers = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layers, num_layers)
-        self.fc_out = nn.Linear(d_model, vocab_size)
+
+class TabularSeq2SeqTransformer(nn.Module):
+    def __init__(
+        self,
+        categorical_cardinalities: List[int],
+        num_continuous: int,
+        d_model: int,
+        nhead: int,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
         self.d_model = d_model
-    
-    def _generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        self.num_categorical = len(categorical_cardinalities)
+        self.num_continuous = num_continuous
+
+        self.categorical_embeddings = nn.ModuleList(
+            [nn.Embedding(cardinality, d_model, padding_idx=0) for cardinality in categorical_cardinalities]
+        )
+        self.continuous_embeddings = nn.ModuleList(
+            [nn.Linear(1, d_model) for _ in range(num_continuous)]
+        )
+
+        self.encoder_positional = PositionalEncoding(d_model, dropout)
+        self.decoder_positional = PositionalEncoding(d_model, dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+
+        self.categorical_heads = nn.ModuleList(
+            [nn.Linear(d_model, cardinality) for cardinality in categorical_cardinalities]
+        )
+        self.continuous_heads = nn.ModuleList([nn.Linear(d_model, 1) for _ in range(num_continuous)])
+        self.stop_head = nn.Linear(d_model, 1)
+
+    def _embed_inputs(self, categorical: torch.Tensor, continuous: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len = categorical.shape[0], categorical.shape[1]
+        device = categorical.device if categorical.numel() > 0 else continuous.device
+        embeddings = torch.zeros(batch_size, seq_len, self.d_model, device=device)
+
+        for idx, embed in enumerate(self.categorical_embeddings):
+            col_values = categorical[:, :, idx]
+            embeddings = embeddings + embed(col_values)
+
+        for idx, projection in enumerate(self.continuous_embeddings):
+            col_values = continuous[:, :, idx].unsqueeze(-1)
+            embeddings = embeddings + projection(col_values)
+
+        return embeddings
+
+    def forward(
+        self,
+        encoder_categorical: torch.Tensor,
+        encoder_continuous: torch.Tensor,
+        decoder_categorical: torch.Tensor,
+        decoder_continuous: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        encoder_inputs = self._embed_inputs(encoder_categorical, encoder_continuous)
+        decoder_inputs = self._embed_inputs(decoder_categorical, decoder_continuous)
+
+        encoder_inputs = self.encoder_positional(encoder_inputs)
+        decoder_inputs = self.decoder_positional(decoder_inputs)
+
+        memory = self.transformer_encoder(
+            encoder_inputs,
+            src_key_padding_mask=src_key_padding_mask,
+        )
+
+        tgt_mask = self.generate_square_subsequent_mask(decoder_inputs.size(1)).to(decoder_inputs.device)
+
+        decoded = self.transformer_decoder(
+            tgt=decoder_inputs,
+            memory=memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )
+
+        categorical_logits = [head(decoded) for head in self.categorical_heads]
+        continuous_preds = [head(decoded).squeeze(-1) for head in self.continuous_heads]
+        stop_logits = self.stop_head(decoded).squeeze(-1)
+
+        return {
+            "categorical_logits": categorical_logits,
+            "continuous_preds": continuous_preds,
+            "stop_logits": stop_logits,
+        }
+
+    @staticmethod
+    def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
+        mask = torch.triu(torch.ones(sz, sz), diagonal=1).bool()
+        mask = mask.float().masked_fill(mask, float("-inf"))
         return mask
 
-    def forward(self, src, src_mask):
-        src = self.embedding(src) * math.sqrt(self.d_model)
-        output = self.transformer_decoder(tgt=src, memory=src, tgt_mask=src_mask, memory_mask=src_mask)
-        output = self.fc_out(output)
-        return output
 
-# --- 4. Training and Synthesis Functions ---
+def compute_losses(
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    total_loss = torch.tensor(0.0, device=outputs["stop_logits"].device)
+    breakdown: Dict[str, float] = {}
 
-def train_model(model, dataloader, criterion, optimizer, device, epochs=10):
-    """Function to train the model."""
+    categorical_losses = []
+    for idx, logits in enumerate(outputs["categorical_logits"]):
+        targets = batch["target_categorical"][:, :, idx]
+        mask = batch["target_categorical_mask"][:, :, idx]
+        if mask.any():
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            targets_flat = targets.reshape(-1)
+            mask_flat = mask.reshape(-1)
+            loss = F.cross_entropy(logits_flat[mask_flat], targets_flat[mask_flat])
+            categorical_losses.append(loss)
+    if categorical_losses:
+        cat_loss = torch.stack(categorical_losses).mean()
+        total_loss = total_loss + cat_loss
+        breakdown["categorical"] = float(cat_loss.detach().cpu())
+
+    continuous_losses = []
+    for idx, preds in enumerate(outputs["continuous_preds"]):
+        targets = batch["target_continuous"][:, :, idx]
+        mask = batch["target_continuous_mask"][:, :, idx]
+        if mask.any():
+            preds_flat = preds.reshape(-1)
+            targets_flat = targets.reshape(-1)
+            mask_flat = mask.reshape(-1)
+            loss = F.mse_loss(preds_flat[mask_flat], targets_flat[mask_flat])
+            continuous_losses.append(loss)
+    if continuous_losses:
+        cont_loss = torch.stack(continuous_losses).mean()
+        total_loss = total_loss + cont_loss
+        breakdown["continuous"] = float(cont_loss.detach().cpu())
+
+    stop_logits = outputs["stop_logits"]
+    stop_targets = batch["stop_targets"]
+    stop_mask = batch["stop_mask"]
+    if stop_mask.any():
+        logits_flat = stop_logits.reshape(-1)
+        targets_flat = stop_targets.reshape(-1)
+        mask_flat = stop_mask.reshape(-1)
+        stop_loss = F.binary_cross_entropy_with_logits(logits_flat[mask_flat], targets_flat[mask_flat])
+        total_loss = total_loss + stop_loss
+        breakdown["stop"] = float(stop_loss.detach().cpu())
+
+    return total_loss, breakdown
+
+
+def train_model(
+    model: TabularSeq2SeqTransformer,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epochs: int = 10,
+) -> None:
     model.train()
     print("Starting training...")
     for epoch in range(epochs):
-        total_loss = 0
-        for i, (inputs, targets) in enumerate(dataloader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            seq_len = inputs.size(1)
-            mask = model._generate_square_subsequent_mask(seq_len).to(device)
+        total_loss = 0.0
+        batches = 0
+        for batch in dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad()
-            outputs = model(inputs, mask)
-            loss = criterion(outputs.view(-1, model.fc_out.out_features), targets.view(-1))
+            outputs = model(
+                encoder_categorical=batch["encoder_categorical"],
+                encoder_continuous=batch["encoder_continuous"],
+                decoder_categorical=batch["decoder_categorical"],
+                decoder_continuous=batch["decoder_continuous"],
+                src_key_padding_mask=batch["encoder_padding_mask"],
+                tgt_key_padding_mask=batch["decoder_padding_mask"],
+                memory_key_padding_mask=batch["encoder_padding_mask"],
+            )
+            loss, _ = compute_losses(outputs, batch)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / len(dataloader)
-        print(f'Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}')
+            total_loss += float(loss.detach().cpu())
+            batches += 1
+        avg_loss = total_loss / max(1, batches)
+        print(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}")
     print("Training finished.")
 
-def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, top_k=10):
-    """
-    Generates synthetic data using the trained model with top-k sampling.
-    """
+
+def synthesize_data(
+    model: TabularSeq2SeqTransformer,
+    preprocessor: SDTMPreprocessor,
+    device: torch.device,
+    num_subjects: int = 5,
+    max_steps: int = 20,
+    stop_threshold: float = 0.5,
+) -> pd.DataFrame:
     model.eval()
-    synthetic_subjects_tokens = []
-    sos_token = preprocessor.vocab['[SOS]']
-    eos_token = preprocessor.vocab['[EOS]']
-    
-    print(f"\nSynthesizing {num_subjects} subjects with Top-k sampling (k={top_k})...")
+    generated_subjects: List[List[Dict[str, object]]] = []
 
-    # Tokens that should never be sampled as values (e.g., placeholders for NaNs)
-    nan_token_ids = {
-        token_id
-        for token_str, token_id in preprocessor.vocab.items()
-        if token_str.endswith('__nan')
-    }
     with torch.no_grad():
-        for i in range(num_subjects):
-            subject_seq = [sos_token]
-            for _ in range(max_len - 1):
-                input_tensor = torch.tensor([subject_seq], dtype=torch.long).to(device)
-                seq_len = input_tensor.size(1)
-                mask = model._generate_square_subsequent_mask(seq_len).to(device)
-                
-                output = model(input_tensor, mask)
+        for _ in range(num_subjects):
+            cat_indices, cont_values, sampled_row = preprocessor.sample_first_row()
+            subject_rows = [sampled_row.copy()]
 
-                # --- Top-k Sampling Logic ---
-                # Get the logits for the very last token in the sequence
-                next_token_logits = output[0, -1, :]
+            decoder_cat = torch.tensor([cat_indices], dtype=torch.long, device=device).unsqueeze(0)
+            decoder_cont = torch.tensor([cont_values], dtype=torch.float32, device=device).unsqueeze(0)
 
-                # Prevent sampling of structural tokens that should not appear as values
-                disallowed_tokens = [
-                    preprocessor.vocab.get('[PAD]'),
-                    preprocessor.vocab.get('[SOS]'),
-                ]
-                for token_id in disallowed_tokens:
-                    if token_id is not None:
-                        next_token_logits[token_id] = float('-inf')
+            for _ in range(max_steps):
+                encoder_cat = decoder_cat[:, :1, :]
+                encoder_cont = decoder_cont[:, :1, :]
 
-                for token_id in nan_token_ids:
-                    next_token_logits[token_id] = float('-inf')
+                outputs = model(
+                    encoder_categorical=encoder_cat,
+                    encoder_continuous=encoder_cont,
+                    decoder_categorical=decoder_cat,
+                    decoder_continuous=decoder_cont,
+                    src_key_padding_mask=torch.zeros((1, encoder_cat.size(1)), dtype=torch.bool, device=device),
+                    tgt_key_padding_mask=torch.zeros((1, decoder_cat.size(1)), dtype=torch.bool, device=device),
+                    memory_key_padding_mask=torch.zeros((1, encoder_cat.size(1)), dtype=torch.bool, device=device),
+                )
 
-                # Filter to get the top k logits and their indices
-                top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
-                
-                # Convert the filtered logits to a probability distribution
-                probabilities = torch.nn.functional.softmax(top_k_logits, dim=-1)
-                
-                # Sample from this new distribution to get the index of the chosen token
-                sampled_index_in_top_k = torch.multinomial(probabilities, 1)
-                
-                # Get the actual token ID from the top_k_indices
-                next_token = top_k_indices[sampled_index_in_top_k].item()
-                
-                subject_seq.append(next_token)
-                if next_token == eos_token:
+                stop_logit = outputs["stop_logits"][0, -1]
+                stop_prob = torch.sigmoid(stop_logit).item()
+                if stop_prob > stop_threshold:
                     break
 
-            if subject_seq[-1] != eos_token: subject_seq.append(eos_token)
-            synthetic_subjects_tokens.append(subject_seq)
+                next_cat_indices: List[int] = []
+                next_cont_values: List[float] = []
+                next_row: Dict[str, object] = {}
 
-    records = []
-    expected_cols = preprocessor.columns
-    non_subject_cols = [
-        col for col in expected_cols if col != preprocessor.subject_id_col
-    ]
+                for idx, logits in enumerate(outputs["categorical_logits"]):
+                    probs = torch.softmax(logits[0, -1], dim=-1)
+                    predicted_index = torch.argmax(probs).item()
+                    next_cat_indices.append(predicted_index)
+                    value = preprocessor.decode_categorical(preprocessor.categorical_cols[idx], predicted_index)
+                    next_row[preprocessor.categorical_cols[idx]] = np.nan if value == "<NA>" else value
 
-    pad_token = preprocessor.vocab['[PAD]']
-    sep_token = preprocessor.vocab['[SEP]']
-    eor_token = preprocessor.vocab['[EOR]']
-    eos_token = preprocessor.vocab['[EOS]']
+                for idx, preds in enumerate(outputs["continuous_preds"]):
+                    predicted_value = preds[0, -1].item()
+                    denorm = preprocessor.denormalize_continuous(preprocessor.continuous_cols[idx], predicted_value)
+                    next_cont_values.append(predicted_value)
+                    next_row[preprocessor.continuous_cols[idx]] = denorm
 
-    for i, subject_tokens in enumerate(synthetic_subjects_tokens):
-        synth_usubjid = f"SYNTH-{i+1:03d}"
+                subject_rows.append(next_row)
 
-        current_record = {}
+                next_cat_tensor = torch.tensor([next_cat_indices], dtype=torch.long, device=device).unsqueeze(0)
+                next_cont_tensor = torch.tensor([next_cont_values], dtype=torch.float32, device=device).unsqueeze(0)
+                decoder_cat = torch.cat([decoder_cat, next_cat_tensor], dim=1)
+                decoder_cont = torch.cat([decoder_cont, next_cont_tensor], dim=1)
 
-        def flush_record():
-            if all(col in current_record for col in non_subject_cols):
-                record = {
-                    **{col: current_record[col] for col in non_subject_cols},
-                    preprocessor.subject_id_col: synth_usubjid,
-                }
-                records.append(record)
+            generated_subjects.append(subject_rows)
 
-        for token in subject_tokens[1:]:  # Skip [SOS]
-            if token in (pad_token, sep_token):
-                continue
-
-            if token == eor_token:
-                flush_record()
-                current_record = {}
-                continue
-
-            if token == eos_token:
-                flush_record()
-                break
-
-            token_str = preprocessor.reverse_vocab.get(token)
-            if token_str is None or '__' not in token_str:
-                continue
-
-            token_col, token_value = token_str.split('__', 1)
-
-            if token_col not in non_subject_cols:
-                continue
-
-            if token_col in current_record:
-                # Avoid overwriting already generated values for a column within the same record
-                continue
-
-            if preprocessor.column_types.get(token_col) == "continuous":
-                try:
-                    bin_idx = int(token_value)
-                except ValueError:
-                    continue
-
-                edges = preprocessor.bin_edges.get(token_col)
-                if edges is None or not (0 <= bin_idx < len(edges) - 1):
-                    continue
-
-                lower, upper = edges[bin_idx], edges[bin_idx + 1]
-                if np.isfinite(lower) and np.isfinite(upper):
-                    current_record[token_col] = np.random.uniform(lower, upper)
-                elif np.isfinite(lower):
-                    current_record[token_col] = lower
-                elif np.isfinite(upper):
-                    current_record[token_col] = upper
-            else:
-                current_record[token_col] = token_value
-
-        # Ensure the last record is considered even if EOS was missing
-        flush_record()
-
-    return pd.DataFrame(records)
+    return preprocessor.build_dataframe_from_sequences(generated_subjects)
 
 
-# --- 5. Dummy Data Generation ---
-def generate_dummy_data(domain='EX', num_subjects=100):
-    """Generates dummy SDTM data for various domains."""
-    if domain == 'EX':
+def generate_dummy_data(domain: str = "EX", num_subjects: int = 100) -> pd.DataFrame:
+    if domain == "EX":
         data = []
         for i in range(num_subjects):
             usubjid = f"SUBJ-{i+1:03d}"
@@ -421,106 +652,119 @@ def generate_dummy_data(domain='EX', num_subjects=100):
                 dose = np.random.choice([25, 50, 100])
                 duration = np.random.randint(7, 28)
                 end_day = start_day + duration - 1
-                data.append({'usubjid': usubjid, 'exseq': seq, 'exdose': dose, 'exstdy': start_day, 'exendy': end_day})
+                data.append(
+                    {
+                        "usubjid": usubjid,
+                        "exseq": seq,
+                        "exdose": dose,
+                        "exstdy": start_day,
+                        "exendy": end_day,
+                    }
+                )
                 start_day = end_day + 1
         return pd.DataFrame(data)
-    
-    elif domain == 'AE':
+
+    if domain == "AE":
         data = []
-        terms = ['HEADACHE', 'NAUSEA', 'FATIGUE', 'DIZZINESS']
-        severities = ['MILD', 'MODERATE', 'SEVERE']
+        terms = ["HEADACHE", "NAUSEA", "FATIGUE", "DIZZINESS"]
+        severities = ["MILD", "MODERATE", "SEVERE"]
         for i in range(num_subjects):
             usubjid = f"SUBJ-{i+1:03d}"
             for seq in range(1, np.random.randint(1, 5)):
                 start_day = np.random.randint(1, 50)
                 duration = np.random.randint(1, 10)
-                data.append({
-                    'usubjid': usubjid, 'aeseq': seq, 'aeterm': np.random.choice(terms), 
-                    'aesev': np.random.choice(severities), 'aestdy': start_day, 'aeendy': start_day + duration
-                })
+                data.append(
+                    {
+                        "usubjid": usubjid,
+                        "aeseq": seq,
+                        "aeterm": np.random.choice(terms),
+                        "aesev": np.random.choice(severities),
+                        "aestdy": start_day,
+                        "aeendy": start_day + duration,
+                    }
+                )
         return pd.DataFrame(data)
 
-    elif domain == 'DS':
+    if domain == "DS":
         data = []
-        terms = ['COMPLETED', 'ADVERSE EVENT', 'PHYSICIAN DECISION', 'LOST TO FOLLOW-UP']
+        terms = ["COMPLETED", "ADVERSE EVENT", "PHYSICIAN DECISION", "LOST TO FOLLOW-UP"]
         for i in range(num_subjects):
             usubjid = f"SUBJ-{i+1:03d}"
-            data.append({
-                'usubjid': usubjid, 'dsseq': 1, 'dsterm': np.random.choice(terms),
-                'dsstdy': np.random.randint(50, 100)
-            })
+            data.append(
+                {
+                    "usubjid": usubjid,
+                    "dsseq": 1,
+                    "dsterm": np.random.choice(terms),
+                    "dsstdy": np.random.randint(50, 100),
+                }
+            )
         return pd.DataFrame(data)
-    else:
-        raise ValueError(f"Domain '{domain}' not supported for dummy data generation.")
 
-# --- 6. Main Execution Block ---
+    raise ValueError(f"Domain '{domain}' not supported for dummy data generation.")
 
-if __name__ == '__main__':
-    # --- Configuration ---
-    DOMAIN = 'AE'  # <-- CHANGE THIS TO 'EX', 'AE', 'DS', etc.
-    MAX_SEQ_LEN = 256
+
+if __name__ == "__main__":
+    DOMAIN = "AE"
     BATCH_SIZE = 8
     D_MODEL = 128
     NHEAD = 8
-    NUM_LAYERS = 4
-    DIM_FEEDFORWARD = 512
-    EPOCHS = 25
-    
+    NUM_ENCODER_LAYERS = 2
+    NUM_DECODER_LAYERS = 2
+    DIM_FEEDFORWARD = 256
+    EPOCHS = 10
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Domain-specific settings ---
-    if DOMAIN == 'EX':
-        SUBJECT_ID_COL, SEQUENCE_COL = 'usubjid', 'exseq'
-        CONTINUOUS_COLS = ['exdose', 'exstdy', 'exendy']
-        BIN_COUNTS = {'exdose': 10, 'exstdy': 30, 'exendy': 30}
-    elif DOMAIN == 'AE':
-        SUBJECT_ID_COL, SEQUENCE_COL = 'usubjid', 'aeseq'
-        CONTINUOUS_COLS = ['aestdy', 'aeendy']
-        BIN_COUNTS = {'aestdy': 30, 'aeendy': 30}
-    elif DOMAIN == 'DS':
-        SUBJECT_ID_COL, SEQUENCE_COL = 'usubjid', 'dsseq'
-        CONTINUOUS_COLS = ['dsstdy']
-        BIN_COUNTS = {'dsstdy': 20}
+    if DOMAIN == "EX":
+        SUBJECT_ID_COL, SEQUENCE_COL = "usubjid", "exseq"
+        CONTINUOUS_COLS = ["exdose", "exstdy", "exendy"]
+    elif DOMAIN == "AE":
+        SUBJECT_ID_COL, SEQUENCE_COL = "usubjid", "aeseq"
+        CONTINUOUS_COLS = ["aestdy", "aeendy"]
+    elif DOMAIN == "DS":
+        SUBJECT_ID_COL, SEQUENCE_COL = "usubjid", "dsseq"
+        CONTINUOUS_COLS = ["dsstdy"]
     else:
         raise ValueError(f"Configuration for domain '{DOMAIN}' not found.")
 
-    # --- Generate and Load Data ---
-    print(f"\nGenerating dummy training data for {DOMAIN} domain...")
+    print()
+    print(f"Generating dummy training data for {DOMAIN} domain...")
     train_df = generate_dummy_data(domain=DOMAIN, num_subjects=200)
     print("Dummy data generated. Shape:", train_df.shape)
     print("Sample data:\n", train_df.head())
 
-    # --- Preprocess Data ---
     preprocessor = SDTMPreprocessor(
-        subject_id_col=SUBJECT_ID_COL, sequence_col=SEQUENCE_COL,
-        continuous_cols=CONTINUOUS_COLS, bin_counts=BIN_COUNTS
+        subject_id_col=SUBJECT_ID_COL,
+        sequence_col=SEQUENCE_COL,
+        continuous_cols=CONTINUOUS_COLS,
     )
     preprocessor.fit(train_df)
-    tokenized_data = preprocessor.transform(train_df)
-    vocab_size = preprocessor.get_vocab_size()
-    print(f"\nVocabulary size: {vocab_size}")
+    sequences = preprocessor.transform(train_df)
 
-    # --- Create Dataset and Dataloader ---
-    sdtm_dataset = SDTMDataset(tokenized_data, MAX_SEQ_LEN)
-    dataloader = DataLoader(sdtm_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    categorical_cardinalities = [len(preprocessor.categorical_vocabs[col]) for col in preprocessor.categorical_cols]
+    num_continuous = len(preprocessor.continuous_cols)
 
-    # --- Initialize and Train Model ---
-    model = TabularTransformer(
-        vocab_size=vocab_size, d_model=D_MODEL, nhead=NHEAD,
-        num_layers=NUM_LAYERS, dim_feedforward=DIM_FEEDFORWARD
+    dataset = SDTMDataset(sequences)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=dataset.collate_fn)
+
+    model = TabularSeq2SeqTransformer(
+        categorical_cardinalities=categorical_cardinalities,
+        num_continuous=num_continuous,
+        d_model=D_MODEL,
+        nhead=NHEAD,
+        num_encoder_layers=NUM_ENCODER_LAYERS,
+        num_decoder_layers=NUM_DECODER_LAYERS,
+        dim_feedforward=DIM_FEEDFORWARD,
     ).to(device)
-    criterion = nn.CrossEntropyLoss(ignore_index=preprocessor.vocab['[PAD]'])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
-    train_model(model, dataloader, criterion, optimizer, device, epochs=EPOCHS)
 
-    # --- Synthesize and Display New Data ---
-    synthetic_df = synthesize_data(model, preprocessor, device, num_subjects=3, top_k=10)
-    
-    print(f"\n--- Generated Synthetic SDTM {DOMAIN} Data ---")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    train_model(model, dataloader, optimizer, device, epochs=EPOCHS)
+
+    synthetic_df = synthesize_data(model, preprocessor, device, num_subjects=3, max_steps=10)
+    print()
+    print("--- Generated Synthetic Data ---")
     if not synthetic_df.empty:
-        synthetic_df = synthetic_df.reindex(columns=preprocessor.columns, fill_value=np.nan)
         print(synthetic_df)
     else:
-        print("No data was synthesized. The model may need more training or adjustments.")
-
+        print("No data generated. Try training for more epochs or adjusting hyperparameters.")
