@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import math
 import io
+from pandas.api.types import is_numeric_dtype
 
 # --- 1. Data Preprocessing (Generalized) ---
 
@@ -14,7 +15,16 @@ class SDTMPreprocessor:
     Converts a DataFrame into tokenized sequences and builds a vocabulary.
     This class is generalized to handle various SDTM domains.
     """
-    def __init__(self, subject_id_col, sequence_col, continuous_cols=None, bin_counts=None):
+    def __init__(
+        self,
+        subject_id_col,
+        sequence_col,
+        continuous_cols=None,
+        bin_counts=None,
+        auto_detect_continuous=True,
+        min_bins=5,
+        max_bins=50,
+    ):
         self.vocab = {}
         self.reverse_vocab = {}
         self.special_tokens = {
@@ -25,12 +35,18 @@ class SDTMPreprocessor:
             "[EOR]": 4,  # End of Record
         }
         self.token_counter = len(self.special_tokens)
-        
+
         # Domain-specific configuration
         self.subject_id_col = subject_id_col
         self.sequence_col = sequence_col
-        self.continuous_cols = continuous_cols if continuous_cols else []
-        self.bin_counts = bin_counts if bin_counts else {}
+        self.auto_detect_continuous = auto_detect_continuous
+        self.user_continuous_cols = set(continuous_cols or [])
+        self.bin_counts = bin_counts.copy() if bin_counts else {}
+        self.min_bins = min_bins
+        self.max_bins = max_bins
+        self.continuous_cols = []
+        self.column_types = {}
+        self.bin_edges = {}
         self.columns = []
 
     def _add_to_vocab(self, item):
@@ -45,19 +61,70 @@ class SDTMPreprocessor:
         self.columns = df.columns.tolist()
         df_processed = df.copy()
 
+        detected_continuous = set()
+        if self.auto_detect_continuous:
+            for col in self.columns:
+                if col in (self.subject_id_col, self.sequence_col):
+                    continue
+                if is_numeric_dtype(df_processed[col]):
+                    if df_processed[col].nunique(dropna=True) > 1:
+                        detected_continuous.add(col)
+
+        self.continuous_cols = sorted(
+            (self.user_continuous_cols | detected_continuous)
+            - {self.subject_id_col, self.sequence_col}
+        )
+
+        # Update column types; default to categorical until confirmed continuous
+        self.column_types = {col: "categorical" for col in self.columns}
+
         # Discretize continuous columns
+        refined_continuous = []
         for col in self.continuous_cols:
-            if col in df_processed.columns:
-                num_bins = self.bin_counts.get(col, 10) # Default to 10 bins
-                df_processed[f'{col}_binned'] = pd.cut(df_processed[col], bins=num_bins, labels=False, include_lowest=True)
+            if col not in df_processed.columns:
+                continue
+
+            unique_values = df_processed[col].nunique(dropna=True)
+            if unique_values <= 1:
+                continue
+
+            num_bins = self.bin_counts.get(col)
+            if num_bins is None:
+                num_bins = int(math.sqrt(unique_values)) if unique_values > 0 else self.min_bins
+                num_bins = max(self.min_bins, min(self.max_bins, num_bins))
+            else:
+                num_bins = max(2, num_bins)
+
+            binned, bins = pd.cut(
+                df_processed[col],
+                bins=num_bins,
+                labels=False,
+                include_lowest=True,
+                retbins=True,
+                duplicates="drop",
+            )
+
+            if bins is None or len(bins) <= 1:
+                continue
+
+            df_processed[f"{col}_binned"] = binned
+            self.bin_edges[col] = bins
+            refined_continuous.append(col)
+            self.column_types[col] = "continuous"
+            # Ensure nan token exists for continuous columns
+            self._add_to_vocab(f"{col}__nan")
+
+        self.continuous_cols = refined_continuous
 
         # Build vocabulary from all columns
         for col in self.columns:
             if col in self.continuous_cols:
                 binned_col_name = f"{col}_binned"
+                if binned_col_name not in df_processed:
+                    continue
                 unique_values = df_processed[binned_col_name].dropna().unique()
                 for val in unique_values:
-                    self._add_to_vocab(f"{col}__{int(val)}") # Ensure value is int for consistency
+                    self._add_to_vocab(f"{col}__{int(val)}")  # Ensure value is int for consistency
             else:
                 unique_values = df_processed[col].astype(str).unique()
                 for val in unique_values:
@@ -76,9 +143,13 @@ class SDTMPreprocessor:
         
         # Apply the same binning
         for col in self.continuous_cols:
-             if col in df_processed.columns:
-                num_bins = self.bin_counts.get(col, 10)
-                df_processed[f'{col}_binned'] = pd.cut(df_processed[col], bins=num_bins, labels=False, include_lowest=True)
+            if col in df_processed.columns and col in self.bin_edges:
+                df_processed[f"{col}_binned"] = pd.cut(
+                    df_processed[col],
+                    bins=self.bin_edges[col],
+                    labels=False,
+                    include_lowest=True,
+                )
 
         tokenized_subjects = []
         for _, group in df_processed.groupby(self.subject_id_col):
@@ -304,7 +375,30 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
                     if col_name == preprocessor.subject_id_col:
                         continue
 
-                    record[col_name] = token_value if token_value != 'nan' else np.nan
+                    if preprocessor.column_types.get(col_name) == "continuous":
+                        if token_value == 'nan':
+                            record[col_name] = np.nan
+                        else:
+                            try:
+                                bin_idx = int(token_value)
+                            except ValueError:
+                                record[col_name] = np.nan
+                            else:
+                                edges = preprocessor.bin_edges.get(col_name)
+                                if edges is not None and 0 <= bin_idx < len(edges) - 1:
+                                    lower, upper = edges[bin_idx], edges[bin_idx + 1]
+                                    if np.isfinite(lower) and np.isfinite(upper):
+                                        record[col_name] = np.random.uniform(lower, upper)
+                                    elif np.isfinite(lower):
+                                        record[col_name] = lower
+                                    elif np.isfinite(upper):
+                                        record[col_name] = upper
+                                    else:
+                                        record[col_name] = np.nan
+                                else:
+                                    record[col_name] = np.nan
+                    else:
+                        record[col_name] = token_value if token_value != 'nan' else np.nan
 
                 if not invalid_record and record:
                     record[preprocessor.subject_id_col] = synth_usubjid
