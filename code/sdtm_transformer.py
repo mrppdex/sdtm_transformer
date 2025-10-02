@@ -178,7 +178,7 @@ class TabularTransformer(nn.Module):
         output = self.fc_out(output)
         return output
 
-# --- 4. Training and Synthesis Functions (Unchanged logic) ---
+# --- 4. Training and Synthesis Functions ---
 
 def train_model(model, dataloader, criterion, optimizer, device, epochs=10):
     """Function to train the model."""
@@ -200,14 +200,16 @@ def train_model(model, dataloader, criterion, optimizer, device, epochs=10):
         print(f'Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}')
     print("Training finished.")
 
-def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
-    """Generates synthetic data using the trained model."""
+def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, top_k=10):
+    """
+    Generates synthetic data using the trained model with top-k sampling.
+    """
     model.eval()
     synthetic_subjects_tokens = []
     sos_token = preprocessor.vocab['[SOS]']
     eos_token = preprocessor.vocab['[EOS]']
     
-    print(f"\nSynthesizing {num_subjects} subjects...")
+    print(f"\nSynthesizing {num_subjects} subjects with Top-k sampling (k={top_k})...")
     with torch.no_grad():
         for i in range(num_subjects):
             subject_seq = [sos_token]
@@ -215,9 +217,24 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
                 input_tensor = torch.tensor([subject_seq], dtype=torch.long).to(device)
                 seq_len = input_tensor.size(1)
                 mask = model._generate_square_subsequent_mask(seq_len).to(device)
+                
                 output = model(input_tensor, mask)
-                next_token_logits = output[:, -1, :]
-                next_token = torch.argmax(next_token_logits, dim=-1).item()
+                
+                # --- Top-k Sampling Logic ---
+                # Get the logits for the very last token in the sequence
+                next_token_logits = output[0, -1, :]
+                
+                # Filter to get the top k logits and their indices
+                top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+                
+                # Convert the filtered logits to a probability distribution
+                probabilities = torch.nn.functional.softmax(top_k_logits, dim=-1)
+                
+                # Sample from this new distribution to get the index of the chosen token
+                sampled_index_in_top_k = torch.multinomial(probabilities, 1)
+                
+                # Get the actual token ID from the top_k_indices
+                next_token = top_k_indices[sampled_index_in_top_k].item()
                 
                 subject_seq.append(next_token)
                 if next_token == eos_token:
@@ -233,7 +250,6 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
     for i, subject_tokens in enumerate(synthetic_subjects_tokens):
         synth_usubjid = f"SYNTH-{i+1:03d}"
         
-        # Split the subject's full token stream by the [EOR] token
         record_streams = []
         current_stream = []
         # Start after [SOS]
@@ -258,7 +274,7 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
                     col_name = expected_cols[col_idx]
                     
                     if col_name == preprocessor.subject_id_col:
-                        continue
+                        continue # Skip populating usubjid from token
                     
                     token_str = preprocessor.reverse_vocab.get(token_val)
                     if token_str:
@@ -267,10 +283,13 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
                             _, val = parts
                             record[col_name] = val
                 
-                record[preprocessor.subject_id_col] = synth_usubjid
-                records.append(record)
+                # Only add the record if it wasn't empty
+                if record:
+                    record[preprocessor.subject_id_col] = synth_usubjid
+                    records.append(record)
 
     return pd.DataFrame(records)
+
 
 # --- 5. Dummy Data Generation ---
 def generate_dummy_data(domain='EX', num_subjects=100):
@@ -378,7 +397,7 @@ if __name__ == '__main__':
     train_model(model, dataloader, criterion, optimizer, device, epochs=EPOCHS)
 
     # --- Synthesize and Display New Data ---
-    synthetic_df = synthesize_data(model, preprocessor, device, num_subjects=3)
+    synthetic_df = synthesize_data(model, preprocessor, device, num_subjects=3, top_k=10)
     
     print(f"\n--- Generated Synthetic SDTM {DOMAIN} Data ---")
     if not synthetic_df.empty:
@@ -386,6 +405,4 @@ if __name__ == '__main__':
         print(synthetic_df)
     else:
         print("No data was synthesized. The model may need more training or adjustments.")
-
-
 
