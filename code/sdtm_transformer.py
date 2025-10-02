@@ -22,6 +22,7 @@ class SDTMPreprocessor:
             "[SOS]": 1,  # Start of Subject Sequence
             "[EOS]": 2,  # End of Subject Sequence
             "[SEP]": 3,  # Separator between values in a record
+            "[EOR]": 4,  # End of Record
         }
         self.token_counter = len(self.special_tokens)
         
@@ -88,6 +89,7 @@ class SDTMPreprocessor:
                 group_to_process = group.sort_values(self.sequence_col)
                 
             for _, row in group_to_process.iterrows():
+                record_tokens = []
                 for col in self.columns:
                     if col in self.continuous_cols:
                         binned_col_name = f"{col}_binned"
@@ -97,11 +99,17 @@ class SDTMPreprocessor:
                     else:
                         value = str(row[col])
                         token_str = f"{col}__{value}"
-                    
-                    subject_sequence.append(self.vocab.get(token_str, self.vocab['[PAD]']))
-                    subject_sequence.append(self.vocab['[SEP]'])
+                    record_tokens.append(self.vocab.get(token_str, self.vocab['[PAD]']))
+
+                # Join the tokens for one record with [SEP]
+                for i, token in enumerate(record_tokens):
+                    subject_sequence.append(token)
+                    if i < len(record_tokens) - 1:
+                        subject_sequence.append(self.vocab['[SEP]'])
+
+                # Add End of Record token after each full record
+                subject_sequence.append(self.vocab['[EOR]'])
             
-            subject_sequence.pop() 
             subject_sequence.append(self.vocab['[EOS]'])
             tokenized_subjects.append(subject_sequence)
             
@@ -198,6 +206,7 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
     synthetic_subjects_tokens = []
     sos_token = preprocessor.vocab['[SOS]']
     eos_token = preprocessor.vocab['[EOS]']
+    eor_token = preprocessor.vocab['[EOR]']
     
     print(f"\nSynthesizing {num_subjects} subjects...")
     with torch.no_grad():
@@ -210,28 +219,41 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
                 output = model(input_tensor, mask)
                 next_token_logits = output[:, -1, :]
                 next_token = torch.argmax(next_token_logits, dim=-1).item()
-                if next_token == eos_token:
-                    subject_seq.append(next_token)
-                    break
+                
                 subject_seq.append(next_token)
+                if next_token == eos_token:
+                    break
+
             if subject_seq[-1] != eos_token: subject_seq.append(eos_token)
             synthetic_subjects_tokens.append(subject_seq)
 
     records = []
     for i, subject_tokens in enumerate(synthetic_subjects_tokens):
-        current_record = {preprocessor.subject_id_col: f"SYNTH-{i+1:03d}"}
-        # Skip [SOS] and [EOS]
-        for token in subject_tokens[1:-1]:
+        current_record = {}
+        synth_usubjid = f"SYNTH-{i+1:03d}"
+
+        # Skip [SOS] token
+        for token in subject_tokens[1:]:
             token_str = preprocessor.reverse_vocab.get(token)
-            if token_str == '[SEP]':
-                if len(current_record) > 1: records.append(current_record)
-                current_record = {preprocessor.subject_id_col: f"SYNTH-{i+1:03d}"}
-            elif token_str:
+
+            if token_str == '[EOR]' or token_str == '[EOS]':
+                # A record is complete, or the subject sequence is complete
+                if current_record: # Ensure the record is not empty
+                    current_record[preprocessor.subject_id_col] = synth_usubjid
+                    records.append(current_record)
+                current_record = {} # Reset for the next record
+                if token_str == '[EOS]':
+                    break # Finished with this subject
+            
+            elif token_str and token_str not in ['[SEP]', '[SOS]', '[PAD]']:
                 parts = token_str.split('__')
                 if len(parts) == 2:
                     col, val = parts
-                    if col != preprocessor.subject_id_col: current_record[col] = val
-        if len(current_record) > 1: records.append(current_record)
+                    # We don't need to add the subject ID from the token,
+                    # as we are assigning a new synthetic one.
+                    if col != preprocessor.subject_id_col:
+                        current_record[col] = val
+
     return pd.DataFrame(records)
 
 # --- 5. Dummy Data Generation ---
@@ -348,4 +370,5 @@ if __name__ == '__main__':
         print(synthetic_df)
     else:
         print("No data was synthesized. The model may need more training or adjustments.")
+
 
