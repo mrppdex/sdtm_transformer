@@ -219,11 +219,20 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
                 mask = model._generate_square_subsequent_mask(seq_len).to(device)
                 
                 output = model(input_tensor, mask)
-                
+
                 # --- Top-k Sampling Logic ---
                 # Get the logits for the very last token in the sequence
                 next_token_logits = output[0, -1, :]
-                
+
+                # Prevent sampling of structural tokens that should not appear as values
+                disallowed_tokens = [
+                    preprocessor.vocab.get('[PAD]'),
+                    preprocessor.vocab.get('[SOS]'),
+                ]
+                for token_id in disallowed_tokens:
+                    if token_id is not None:
+                        next_token_logits[token_id] = float('-inf')
+
                 # Filter to get the top k logits and their indices
                 top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
                 
