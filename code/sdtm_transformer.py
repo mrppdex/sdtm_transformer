@@ -206,7 +206,6 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
     synthetic_subjects_tokens = []
     sos_token = preprocessor.vocab['[SOS]']
     eos_token = preprocessor.vocab['[EOS]']
-    eor_token = preprocessor.vocab['[EOR]']
     
     print(f"\nSynthesizing {num_subjects} subjects...")
     with torch.no_grad():
@@ -228,31 +227,48 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5):
             synthetic_subjects_tokens.append(subject_seq)
 
     records = []
+    expected_cols = preprocessor.columns
+    num_cols = len(expected_cols)
+
     for i, subject_tokens in enumerate(synthetic_subjects_tokens):
-        current_record = {}
         synth_usubjid = f"SYNTH-{i+1:03d}"
-
-        # Skip [SOS] token
+        
+        # Split the subject's full token stream by the [EOR] token
+        record_streams = []
+        current_stream = []
+        # Start after [SOS]
         for token in subject_tokens[1:]:
-            token_str = preprocessor.reverse_vocab.get(token)
+            if token == preprocessor.vocab['[EOR]'] or token == preprocessor.vocab['[EOS]']:
+                if current_stream:
+                    record_streams.append(current_stream)
+                current_stream = []
+                if token == preprocessor.vocab['[EOS]']:
+                    break
+            else:
+                current_stream.append(token)
 
-            if token_str == '[EOR]' or token_str == '[EOS]':
-                # A record is complete, or the subject sequence is complete
-                if current_record: # Ensure the record is not empty
-                    current_record[preprocessor.subject_id_col] = synth_usubjid
-                    records.append(current_record)
-                current_record = {} # Reset for the next record
-                if token_str == '[EOS]':
-                    break # Finished with this subject
-            
-            elif token_str and token_str not in ['[SEP]', '[SOS]', '[PAD]']:
-                parts = token_str.split('__')
-                if len(parts) == 2:
-                    col, val = parts
-                    # We don't need to add the subject ID from the token,
-                    # as we are assigning a new synthetic one.
-                    if col != preprocessor.subject_id_col:
-                        current_record[col] = val
+        for stream in record_streams:
+            # Filter out separator tokens to get only value tokens
+            value_tokens = [t for t in stream if t != preprocessor.vocab['[SEP]']]
+
+            # A valid record must have the same number of value tokens as columns
+            if len(value_tokens) == num_cols:
+                record = {}
+                for col_idx, token_val in enumerate(value_tokens):
+                    col_name = expected_cols[col_idx]
+                    
+                    if col_name == preprocessor.subject_id_col:
+                        continue
+                    
+                    token_str = preprocessor.reverse_vocab.get(token_val)
+                    if token_str:
+                        parts = token_str.split('__')
+                        if len(parts) == 2:
+                            _, val = parts
+                            record[col_name] = val
+                
+                record[preprocessor.subject_id_col] = synth_usubjid
+                records.append(record)
 
     return pd.DataFrame(records)
 
@@ -370,5 +386,6 @@ if __name__ == '__main__':
         print(synthetic_df)
     else:
         print("No data was synthesized. The model may need more training or adjustments.")
+
 
 
