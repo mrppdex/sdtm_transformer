@@ -339,94 +339,72 @@ def synthesize_data(model, preprocessor, device, max_len=200, num_subjects=5, to
         col for col in expected_cols if col != preprocessor.subject_id_col
     ]
 
+    pad_token = preprocessor.vocab['[PAD]']
+    sep_token = preprocessor.vocab['[SEP]']
+    eor_token = preprocessor.vocab['[EOR]']
+    eos_token = preprocessor.vocab['[EOS]']
+
     for i, subject_tokens in enumerate(synthetic_subjects_tokens):
         synth_usubjid = f"SYNTH-{i+1:03d}"
-        
-        record_streams = []
-        current_stream = []
-        # Start after [SOS]
-        for token in subject_tokens[1:]:
-            if token == preprocessor.vocab['[EOR]'] or token == preprocessor.vocab['[EOS]']:
-                if current_stream:
-                    record_streams.append(current_stream)
-                current_stream = []
-                if token == preprocessor.vocab['[EOS]']:
-                    break
-            else:
-                current_stream.append(token)
 
-        for stream in record_streams:
-            # Split stream into segments separated by [SEP] tokens.
-            segments = []
-            current_segment = []
-            for token_val in stream:
-                if token_val == preprocessor.vocab['[SEP]']:
-                    if current_segment:
-                        segments.append(current_segment)
-                        current_segment = []
-                elif token_val == preprocessor.vocab['[PAD]']:
+        current_record = {}
+
+        def flush_record():
+            if all(col in current_record for col in non_subject_cols):
+                record = {
+                    **{col: current_record[col] for col in non_subject_cols},
+                    preprocessor.subject_id_col: synth_usubjid,
+                }
+                records.append(record)
+
+        for token in subject_tokens[1:]:  # Skip [SOS]
+            if token in (pad_token, sep_token):
+                continue
+
+            if token == eor_token:
+                flush_record()
+                current_record = {}
+                continue
+
+            if token == eos_token:
+                flush_record()
+                break
+
+            token_str = preprocessor.reverse_vocab.get(token)
+            if token_str is None or '__' not in token_str:
+                continue
+
+            token_col, token_value = token_str.split('__', 1)
+
+            if token_col not in non_subject_cols:
+                continue
+
+            if token_col in current_record:
+                # Avoid overwriting already generated values for a column within the same record
+                continue
+
+            if preprocessor.column_types.get(token_col) == "continuous":
+                try:
+                    bin_idx = int(token_value)
+                except ValueError:
                     continue
-                else:
-                    current_segment.append(token_val)
-            if current_segment:
-                segments.append(current_segment)
 
-            if not segments:
-                continue
+                edges = preprocessor.bin_edges.get(token_col)
+                if edges is None or not (0 <= bin_idx < len(edges) - 1):
+                    continue
 
-            record = {}
-            valid_record = True
+                lower, upper = edges[bin_idx], edges[bin_idx + 1]
+                if np.isfinite(lower) and np.isfinite(upper):
+                    current_record[token_col] = np.random.uniform(lower, upper)
+                elif np.isfinite(lower):
+                    current_record[token_col] = lower
+                elif np.isfinite(upper):
+                    current_record[token_col] = upper
+            else:
+                current_record[token_col] = token_value
 
-            for col, segment in zip(non_subject_cols, segments):
-                if not segment:
-                    valid_record = False
-                    break
-
-                token_val = segment[0]
-                token_str = preprocessor.reverse_vocab.get(token_val)
-
-                if token_str is None or '__' not in token_str:
-                    valid_record = False
-                    break
-
-                token_col, token_value = token_str.split('__', 1)
-
-                # Ensure the generated token corresponds to the expected column order
-                if token_col != col:
-                    valid_record = False
-                    break
-
-                if preprocessor.column_types.get(token_col) == "continuous":
-                    try:
-                        bin_idx = int(token_value)
-                    except ValueError:
-                        valid_record = False
-                        break
-
-                    edges = preprocessor.bin_edges.get(token_col)
-                    if edges is None or not (0 <= bin_idx < len(edges) - 1):
-                        valid_record = False
-                        break
-
-                    lower, upper = edges[bin_idx], edges[bin_idx + 1]
-                    if np.isfinite(lower) and np.isfinite(upper):
-                        record[token_col] = np.random.uniform(lower, upper)
-                    elif np.isfinite(lower):
-                        record[token_col] = lower
-                    elif np.isfinite(upper):
-                        record[token_col] = upper
-                    else:
-                        valid_record = False
-                        break
-                else:
-                    record[token_col] = token_value
-
-            # Ensure every expected non-subject column has been populated exactly once
-            if not valid_record or len(record) != len(non_subject_cols):
-                continue
-
-            record[preprocessor.subject_id_col] = synth_usubjid
-            records.append(record)
+        # Ensure the last record is considered even if EOS was missing
+        flush_record()
 
     return pd.DataFrame(records)
 
